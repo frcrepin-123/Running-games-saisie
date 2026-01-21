@@ -350,6 +350,7 @@ button{
   object-fit:cover !important;
 }
 
+/* Hide html5-qrcode overlays */
 #reader__dashboard_section,
 #reader__dashboard_section_csr,
 #reader__dashboard_section_swaplink,
@@ -610,6 +611,8 @@ button{
 <script>
 /* =========================================================
    CONFIG
+   IMPORTANT: ce script n'utilise PLUS aucun fetch vers Apps Script (CORS).
+   Tout passe en JSONP (script tag).
 ========================================================= */
 const API_BASE = "https://script.google.com/macros/s/AKfycbxmddS3Y-40rxY1zK5yR7dGQaTQpbHqJwU5RS7dQtSDMFRQsrjvzd1XJ1zZek6zVAQP4A/exec";
 
@@ -766,7 +769,6 @@ async function scanQueryLatest_(limit){
 }
 
 async function scanPickPendingBatch_(maxBatch){
-  // prend les plus anciens "pending" non cancelled
   const db = await openDb_();
   return new Promise((resolve, reject) => {
     const out = [];
@@ -787,53 +789,72 @@ async function scanPickPendingBatch_(maxBatch){
   });
 }
 
-async function scanBulkUpdateStatus_(ids, newStatus){
-  if (!ids.length) return;
-  const db = await openDb_();
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction("scans", "readwrite");
-    const st = tx.objectStore("scans");
-    tx.oncomplete = () => resolve(true);
-    tx.onerror = () => reject(tx.error);
-
-    ids.forEach(id => {
-      const getReq = st.get(id);
-      getReq.onsuccess = () => {
-        const v = getReq.result;
-        if (!v) return;
-        v.status = newStatus;
-        st.put(v);
-      };
-    });
-  });
-}
-
-async function scanBulkMarkSent_(ids){
-  return scanBulkUpdateStatus_(ids, "sent");
-}
-
-async function scanBulkBackToPending_(ids){
-  return scanBulkUpdateStatus_(ids, "pending");
-}
-
 async function scanMarkCancelled_(id){
   const v = await scanGet_(id);
   if (!v) return false;
   v.cancelled = true;
-  // si pas envoyé, on le sort du flux
   if (v.status === "pending" || v.status === "inflight") v.status = "cancelled";
   await scanPut_(v);
   return true;
 }
 
 /* =========================================================
+   JSONP helpers (PAS DE FETCH, PAS DE CORS)
+========================================================= */
+function b64WebSafe_(str){
+  const utf8 = new TextEncoder().encode(str);
+  let bin = "";
+  utf8.forEach(b => bin += String.fromCharCode(b));
+  return btoa(bin).replace(/\+/g,"-").replace(/\//g,"_").replace(/=+$/,"");
+}
+
+function jsonpCall_(paramsObj, timeoutMs = 15000){
+  return new Promise((resolve, reject) => {
+    const cbName = "__rg_cb_" + Math.random().toString(36).slice(2);
+    const params = { ...paramsObj, callback: cbName, _: String(Date.now()) };
+    const qs = new URLSearchParams(params).toString();
+    const url = `${API_BASE}?${qs}`;
+
+    const script = document.createElement("script");
+    let timer = null;
+
+    window[cbName] = (res) => {
+      cleanup();
+      resolve(res);
+    };
+
+    function cleanup(){
+      if (timer) clearTimeout(timer);
+      try { delete window[cbName]; } catch(e) { window[cbName] = undefined; }
+      if (script && script.parentNode) script.parentNode.removeChild(script);
+    }
+
+    timer = setTimeout(() => {
+      cleanup();
+      reject(new Error("JSONP timeout"));
+    }, timeoutMs);
+
+    script.onerror = () => {
+      cleanup();
+      reject(new Error("JSONP load error"));
+    };
+
+    script.src = url;
+    document.head.appendChild(script);
+  });
+}
+
+function jsonpAppend_(lot, timeoutMs = 15000){
+  const payload = b64WebSafe_(JSON.stringify(lot));
+  return jsonpCall_({ action: "append", payload }, timeoutMs);
+}
+
+/* =========================================================
    Persistence helpers (meta)
 ========================================================= */
-
 async function persistMeta_(){
   await kvSet_("metaUser", { nom, emplacement, isLocked: false });
 }
-
 async function loadMeta_(){
   const meta = await kvGet_("metaUser");
   if (meta && meta.nom && meta.emplacement) {
@@ -946,14 +967,8 @@ function setEmplSelected(val){
 }
 emplBtns.forEach(btn => btn.addEventListener("click", () => setEmplSelected(btn.dataset.empl)));
 
-async function updateSyncChip(){
-  const total = await countPendingPlusInflight_();
-  chipSync.textContent = sending ? `Sync… ${total}` : `Sync: ${total}`;
-  chipSync.classList.toggle("sending", !!sending);
-}
-
 async function countPendingPlusInflight_(){
-  const latest = await scanQueryLatest_(5000); // cheap enough for your volumes
+  const latest = await scanQueryLatest_(5000);
   let n = 0;
   for (const s of latest){
     if (!s || s.cancelled) continue;
@@ -962,16 +977,22 @@ async function countPendingPlusInflight_(){
   return n;
 }
 
+async function updateSyncChip(){
+  const total = await countPendingPlusInflight_();
+  chipSync.textContent = sending ? `Sync… ${total}` : `Sync: ${total}`;
+  chipSync.classList.toggle("sending", !!sending);
+}
+
 async function renderHistory(){
   if (isLocked){
     history.innerHTML = `<div class="placeholder">En attente de validation (Nom + Emplacement)…</div>`;
     return;
   }
 
-  const max = (mode === "historique") ? 5000 : 5; // 5 en saisie/scan
+  const max = (mode === "historique") ? 5000 : 5;
   const scans = await scanQueryLatest_(max);
 
-  const visible = scans.filter(s => s && s.status !== "cancelled"); // on affiche aussi "sent"
+  const visible = scans.filter(s => s && s.status !== "cancelled");
   if (!visible.length){
     history.innerHTML = `<div class="placeholder">Aucun scan pour l’instant.</div>`;
     return;
@@ -1015,7 +1036,6 @@ window.addEventListener("load", async () => {
     setMode("saisie", { skipFocus:true });
   }
 
-  // si on a du pending, on tente
   const batch = await scanPickPendingBatch_(1);
   if (batch.length > 0) scheduleSend();
 
@@ -1098,7 +1118,6 @@ btnEdit.addEventListener("click", async () => {
   manualbar.style.display = "none";
   camerabar.style.display = "none";
 
-  // on enlève seulement metaUser (pas les scans)
   await kvDel_("metaUser");
 
   await renderHistory();
@@ -1166,7 +1185,7 @@ btnValider.addEventListener("click", validerSaisie);
 dossardInput.addEventListener("keydown", (e) => { if (e.key === "Enter") validerSaisie(); });
 
 /* =========================================================
-   Cancel (annuler)
+   Cancel (annuler) — JSONP (pas fetch)
 ========================================================= */
 async function annuler(id, btn){
   const scan = await scanGet_(id);
@@ -1175,7 +1194,6 @@ async function annuler(id, btn){
   const label = `${format(scan.tsMs)} — ${scan.emplacement} — #${scan.dossard}`;
   if (!confirm(`Supprimer : ${label} ?`)) return;
 
-  // si pas encore envoyé -> annulation locale
   if (scan.status === "pending" || scan.status === "inflight"){
     await scanMarkCancelled_(id);
     await updateSyncChip();
@@ -1183,13 +1201,11 @@ async function annuler(id, btn){
     return;
   }
 
-  // sinon annulation serveur (Scan/Buffer)
   const oldText = btn.textContent;
   btn.disabled = true;
   btn.textContent = "…";
 
-  fetch(`${API_BASE}?action=cancel&id=${encodeURIComponent(id)}`)
-    .then(r => r.json())
+  jsonpCall_({ action: "cancel", id })
     .then(async (res) => {
       if (!res || !res.ok) throw new Error("cancel failed");
       await scanMarkCancelled_(id);
@@ -1204,7 +1220,7 @@ async function annuler(id, btn){
 window.annuler = annuler;
 
 /* =========================================================
-   Sending logic
+   Sending logic — JSONP append
 ========================================================= */
 function scheduleSend() {
   if (!firstScanTimestamp) {
@@ -1221,7 +1237,6 @@ async function sendNow() {
   const batch = await scanPickPendingBatch_(MAX_BATCH);
   if (batch.length === 0) { await updateSyncChip(); return; }
 
-  // lock batch as inflight + compute ageMs
   const now = Date.now();
   const ids = batch.map(s => s.id);
 
@@ -1235,12 +1250,11 @@ async function sendNow() {
   sending = true;
   await updateSyncChip();
 
-  // payload attendu par ton Apps Script: [id, nom, emplacement, dossard, tsMs, "", ageMs]
+  // payload attendu: [id, nom, emplacement, dossard, tsMs, "", ageMs]
   const lot = batch.map(s => [s.id, s.nom, s.emplacement, s.dossard, s.tsMs, "", s.ageMs]);
 
   jsonpAppend_(lot)
     .then(async (res) => {
-      // res attendu: { ok:true }
       if (!res || !res.ok) throw new Error("api error");
 
       for (const id of ids){
@@ -1267,7 +1281,6 @@ async function sendNow() {
       if (more.length > 0) scheduleSend();
     })
     .catch(async () => {
-      // back to pending
       for (const id of ids){
         const s = await scanGet_(id);
         if (!s) continue;
@@ -1284,7 +1297,6 @@ async function sendNow() {
       retryDelay = Math.min(retryDelay * 2, 15000);
     });
 }
-
 
 /* =========================================================
    Scanner
@@ -1408,7 +1420,7 @@ btnScanStop.addEventListener("click", stopScanner);
 window.addEventListener("beforeunload", () => stopScanner());
 
 /* =========================================================
-   Device test (dossard 200)
+   Device test (dossard 200) — JSONP (pas fetch)
 ========================================================= */
 function showTestBanner(html, kind="ok"){
   const bg = (kind === "ok") ? "rgba(0,255,106,0.22)" : "rgba(226,59,59,0.22)";
@@ -1454,8 +1466,7 @@ function runDeviceTest(source){
   showTestBanner(`🧪 TEST EN COURS…<br><span style="opacity:.9">Source: ${source}</span>`, "ok");
 
   battPromise.then(batt => {
-    fetch(`${API_BASE}?action=ping&source=${encodeURIComponent(source)}&t=${encodeURIComponent(clientStart)}`)
-      .then(r => r.json())
+    jsonpCall_({ action: "ping", source: source, t: String(clientStart) })
       .then((res) => {
         const clientMs = Date.now() - clientStart;
 
@@ -1480,54 +1491,6 @@ function runDeviceTest(source){
       });
   });
 }
-
-  function b64WebSafe_(str){
-  // UTF-8 -> base64 websafe
-  const utf8 = new TextEncoder().encode(str);
-  let bin = "";
-  utf8.forEach(b => bin += String.fromCharCode(b));
-  const b64 = btoa(bin).replace(/\+/g,"-").replace(/\//g,"_").replace(/=+$/,"");
-  return b64;
-}
-
-function jsonpAppend_(lot, timeoutMs = 15000){
-  return new Promise((resolve, reject) => {
-    const cbName = "__rg_cb_" + Math.random().toString(36).slice(2);
-    const payload = b64WebSafe_(JSON.stringify(lot));
-
-    const url = `${API_BASE}?action=append&callback=${encodeURIComponent(cbName)}&payload=${encodeURIComponent(payload)}`;
-
-    const script = document.createElement("script");
-    let timer = null;
-
-    window[cbName] = (res) => {
-      cleanup();
-      if (res && res.ok) resolve(res);
-      else reject(res || new Error("append failed"));
-    };
-
-    function cleanup(){
-      if (timer) clearTimeout(timer);
-      delete window[cbName];
-      if (script && script.parentNode) script.parentNode.removeChild(script);
-    }
-
-    timer = setTimeout(() => {
-      cleanup();
-      reject(new Error("JSONP timeout"));
-    }, timeoutMs);
-
-    script.onerror = () => {
-      cleanup();
-      reject(new Error("JSONP load error"));
-    };
-
-    script.src = url;
-    document.head.appendChild(script);
-  });
-}
-
-
 </script>
 </body>
 </html>
